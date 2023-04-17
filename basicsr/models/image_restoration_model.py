@@ -62,6 +62,7 @@ class ImageRestorationModel(BaseModel):
         else:
             self.cri_perceptual = None
 
+        #import ipdb;ipdb.set_trace()
         if self.cri_pix is None and self.cri_perceptual is None:
             raise ValueError('Both pixel and perceptual losses are None.')
 
@@ -233,24 +234,92 @@ class ImageRestorationModel(BaseModel):
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
+    # SegPGD attack code https://arxiv.org/pdf/2207.12391.pdf
+    def fgsm_attack(image, epsilon, alpha, data_grad, clip_min, clip_max):
+        # Collect the element-wise sign of the data gradient
+        sign_data_grad = data_grad.sign()
+        # Create the perturbed image by adjusting each pixel of the input image
+        perturbed_image = image + alpha*sign_data_grad
+        # Adding clipping to maintain [clean_image-epsilon, clean_image+epsilon] range
+        perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+        # Return the perturbed image
+        return perturbed_image
+
     def test(self):
         self.net_g.eval()
-        with torch.no_grad():
-            n = len(self.lq)
-            outs = []
-            m = self.opt['val'].get('max_minibatch', n)
-            i = 0
-            while i < n:
-                j = i + m
-                if j >= n:
-                    j = n
-                pred = self.net_g(self.lq[i:j])
-                if isinstance(pred, list):
-                    pred = pred[-1]
-                outs.append(pred.detach().cpu())
-                i = j
+        #with torch.no_grad():
+        train_opt = self.opt['train']
+        attack_exists = False
+        try:
+            print(self.opt['attack'])
+            attack_exists = True
+        except KeyError:
+            attack_exists = False
+        attack_opt = self.opt['attack'] if attack_exists else None
+        if attack_opt != None:
+            clip_min = self.lq.min() - attack_opt['epsilon']
+            clip_max = self.lq.max() + attack_opt['epsilon']
+            self.lq = self.lq + torch.FloatTensor(self.lq.shape).uniform_(-1*attack_opt['epsilon'], attack_opt['epsilon']).to(self.lq.device)
+            self.lq.requires_grad= True
+            self.lq.retain_grad()
 
-            self.output = torch.cat(outs, dim=0)
+        # define losses
+        if train_opt.get('pixel_opt'):
+            pixel_type = train_opt['pixel_opt'].pop('type')
+            cri_pix_cls = getattr(loss_module, pixel_type)
+            self.cri_pix = cri_pix_cls(**train_opt['pixel_opt']).to(
+                self.device)
+
+        #with torch.enable_grad():
+        #import ipdb;ipdb.set_trace()
+        n = len(self.lq)
+        outs = []
+        m = self.opt['val'].get('max_minibatch', n)
+        i = 0
+        while i < n:
+            j = i + m
+            if j >= n:
+                j = n
+            pred = self.net_g(self.lq[i:j])
+            if isinstance(pred, list):
+                pred = pred[-1]
+            outs.append(pred)#.detach().cpu())
+            i = j
+
+        self.output = torch.cat(outs, dim=0).detach().cpu()
+        
+        if attack_opt !=None and self.cri_pix:        
+            for t in range(attack_opt['iterations']):
+                # pixel loss                
+                l_pix = 0.
+                for pred in outs:
+                    l_pix += self.cri_pix(pred, self.gt)
+
+                    # print('l pix ... ', l_pix)
+                if attack_opt['method'] == 'cospgd':
+                    cossim = F.cosine_similarity(self.lq, self.gt, dim=1, eps=10**-20)
+                    with torch.no_grad():
+                        l_pix *= cossim
+                        l_pix /= l_pix.shape[-1]*l_pix.shape[-2]
+                l_pix.backward(retain_graph=True)
+                data_grad = self.lq.grad
+                self.lq = fgsm_attack(self.lq, attack_opt['epsilon'], attack_opt['alpha'], data_grad, clip_min, clip_max)
+                #images.grad=None
+                outs = []
+                m = self.opt['val'].get('max_minibatch', n)
+                i = 0
+                while i < n:
+                    j = i + m
+                    if j >= n:
+                        j = n
+                    pred = self.net_g(self.lq[i:j])
+                    if isinstance(pred, list):
+                        pred = pred[-1]
+                    outs.append(pred)#.detach().cpu())
+                    i = j
+
+                self.output = torch.cat(outs, dim=0).detach().cpu()
+                self.lq.retain_grad()                
         self.net_g.train()
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
