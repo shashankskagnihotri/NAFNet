@@ -235,40 +235,61 @@ class ImageRestorationModel(BaseModel):
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
     # SegPGD attack code https://arxiv.org/pdf/2207.12391.pdf
-    def fgsm_attack(image, epsilon, alpha, data_grad, clip_min, clip_max):
+    def fgsm_attack(self, image, epsilon, alpha, data_grad, clip_min, clip_max):
         # Collect the element-wise sign of the data gradient
         sign_data_grad = data_grad.sign()
         # Create the perturbed image by adjusting each pixel of the input image
-        perturbed_image = image + alpha*sign_data_grad
+        image = image + alpha*sign_data_grad
         # Adding clipping to maintain [clean_image-epsilon, clean_image+epsilon] range
-        perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+        image = torch.clamp(image, clip_min, clip_max)
         # Return the perturbed image
-        return perturbed_image
+        return image
 
     def test(self):
         self.net_g.eval()
+        #import ipdb;ipdb.set_trace()
+        #dtype = self.lq.dtype
+        #self.net_g.half()
+        #for m in self.net_g.modules():
+        #    m.half()
+        #import ipdb;ipdb.set_trace()
+        #self.lq = self.lq.half()
+        #self.gt = self.gt.half()
         #with torch.no_grad():
-        train_opt = self.opt['train']
+        
         attack_exists = False
+        iterations = 1
         try:
-            print(self.opt['attack'])
+            attack_opt = self.opt['attack']
             attack_exists = True
         except KeyError:
             attack_exists = False
-        attack_opt = self.opt['attack'] if attack_exists else None
+            attack_opt = None
+        
+        #attack_opt = self.opt['attack'] if attack_exists else None
         if attack_opt != None:
+            #print("\n\n\t\t\tATTACKING")
             clip_min = self.lq.min() - attack_opt['epsilon']
             clip_max = self.lq.max() + attack_opt['epsilon']
             self.lq = self.lq + torch.FloatTensor(self.lq.shape).uniform_(-1*attack_opt['epsilon'], attack_opt['epsilon']).to(self.lq.device)
             self.lq.requires_grad= True
             self.lq.retain_grad()
+            iterations = attack_opt['iterations']
 
         # define losses
-        if train_opt.get('pixel_opt'):
-            pixel_type = train_opt['pixel_opt'].pop('type')
-            cri_pix_cls = getattr(loss_module, pixel_type)
-            self.cri_pix = cri_pix_cls(**train_opt['pixel_opt']).to(
-                self.device)
+        if attack_exists:
+            train_opt = self.opt['train']
+            if train_opt.get('pixel_opt'):
+                try:
+                    pixel_type = train_opt['pixel_opt'].pop('type')
+                except Exception:
+                    import ipdb;ipdb.set_trace()
+                #pixel_type = 'PSNRLoss'
+                cri_pix_cls = getattr(loss_module, pixel_type)
+                self.cri_pix = cri_pix_cls(**train_opt['pixel_opt']).to(
+                    self.device)
+                train_opt['pixel_opt']['type'] = pixel_type
+            
 
         #with torch.enable_grad():
         #import ipdb;ipdb.set_trace()
@@ -288,22 +309,26 @@ class ImageRestorationModel(BaseModel):
 
         self.output = torch.cat(outs, dim=0).detach().cpu()
         
-        if attack_opt !=None and self.cri_pix:        
-            for t in range(attack_opt['iterations']):
-                # pixel loss                
+        if attack_exists and self.cri_pix:        
+            for t in range(iterations):
+                # pixel loss   
+                #print("Iterations: {}".format(t))             
                 l_pix = 0.
                 for pred in outs:
                     l_pix += self.cri_pix(pred, self.gt)
 
                     # print('l pix ... ', l_pix)
-                if attack_opt['method'] == 'cospgd':
-                    cossim = F.cosine_similarity(self.lq, self.gt, dim=1, eps=10**-20)
+                if attack_opt['method'] == 'cospgd':                    
                     with torch.no_grad():
-                        l_pix *= cossim
-                        l_pix /= l_pix.shape[-1]*l_pix.shape[-2]
+                        cossim = F.cosine_similarity(self.lq, self.gt, dim=1, eps=10**-20)
+                        #import ipdb;ipdb.set_trace()
+                        l_pix *= cossim.sum()
+                        l_pix /= cossim.shape[-1]*cossim.shape[-2]
                 l_pix.backward(retain_graph=True)
                 data_grad = self.lq.grad
-                self.lq = fgsm_attack(self.lq, attack_opt['epsilon'], attack_opt['alpha'], data_grad, clip_min, clip_max)
+                self.lq = self.fgsm_attack(self.lq, attack_opt['epsilon'], attack_opt['alpha'], data_grad, clip_min, clip_max)
+                #self.lq.requires_grad = True 
+                #print(self.lq.requires_grad)
                 #images.grad=None
                 outs = []
                 m = self.opt['val'].get('max_minibatch', n)
@@ -319,8 +344,13 @@ class ImageRestorationModel(BaseModel):
                     i = j
 
                 self.output = torch.cat(outs, dim=0).detach().cpu()
-                self.lq.retain_grad()                
+                self.lq.retain_grad()                                               
         self.net_g.train()
+        #self.net_g.to(dtype=dtype)
+        #for m in self.net_g.modules():
+        #    m.to(dtype=dtype)
+        #self.lq.to(dtype=dtype)
+        #self.gt.to(dtype=dtype)
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         dataset_name = dataloader.dataset.opt['name']

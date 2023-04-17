@@ -130,8 +130,12 @@ class NAFNet(nn.Module):
         self.padder_size = 2 ** len(self.encoders)
 
     def forward(self, inp):
+        #inp = inp.cuda().half()
+        #self.cuda()        
+        #self.half()
         B, C, H, W = inp.shape
         inp = self.check_image_size(inp)
+        #import ipdb;ipdb.set_trace()
 
         x = self.intro(inp)
 
