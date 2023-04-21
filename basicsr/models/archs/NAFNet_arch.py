@@ -16,6 +16,7 @@ Simple Baselines for Image Restoration
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 
@@ -129,6 +130,7 @@ class NAFNet(nn.Module):
 
         self.padder_size = 2 ** len(self.encoders)
 
+    #@autocast()
     def forward(self, inp):
         #inp = inp.cuda().half()
         #self.cuda()        
@@ -136,6 +138,8 @@ class NAFNet(nn.Module):
         B, C, H, W = inp.shape
         inp = self.check_image_size(inp)
         #import ipdb;ipdb.set_trace()
+
+        #with autocast():
 
         x = self.intro(inp)
 

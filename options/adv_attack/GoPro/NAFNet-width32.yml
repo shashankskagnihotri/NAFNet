@@ -64,7 +64,7 @@ attack:
   method: cospgd
   alpha: 0.03
   epsilon: 0.03
-  iterations: 10
+  iterations: 3
 
 train:
   # losses

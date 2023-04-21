@@ -7,6 +7,7 @@
 import importlib
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from collections import OrderedDict
 from copy import deepcopy
 from os import path as osp
@@ -245,8 +246,10 @@ class ImageRestorationModel(BaseModel):
         # Return the perturbed image
         return image
 
+    #@autocast()
     def test(self):
         self.net_g.eval()
+        #print("\n\n\n\t\t\t\t{}\n\n\n\n".format(self.lq.shape))
         #import ipdb;ipdb.set_trace()
         #dtype = self.lq.dtype
         #self.net_g.half()
@@ -291,69 +294,79 @@ class ImageRestorationModel(BaseModel):
                 train_opt['pixel_opt']['type'] = pixel_type
             
 
-        #with torch.enable_grad():
-        #import ipdb;ipdb.set_trace()
-        n = len(self.lq)
-        outs = []
-        m = self.opt['val'].get('max_minibatch', n)
-        i = 0
-        while i < n:
-            j = i + m
-            if j >= n:
-                j = n
-            pred = self.net_g(self.lq[i:j])
-            if isinstance(pred, list):
-                pred = pred[-1]
-            outs.append(pred)#.detach().cpu())
-            i = j
+        with torch.enable_grad():
+            #import ipdb;ipdb.set_trace()
+            #with autocast():
+            n = len(self.lq)
+            outs = []
+            m = self.opt['val'].get('max_minibatch', n)
+            i = 0
+            while i < n:
+                j = i + m
+                if j >= n:
+                    j = n
+                pred = self.net_g(self.lq[i:j])
+                if isinstance(pred, list):
+                    pred = pred[-1]
+                outs.append(pred)#.detach())#.cpu())
+                i = j
 
-        self.output = torch.cat(outs, dim=0).detach().cpu()
-        
-        if attack_exists and self.cri_pix:        
-            for t in range(iterations):
-                # pixel loss   
-                #print("Iterations: {}".format(t))             
-                l_pix = 0.
-                for pred in outs:
-                    l_pix += self.cri_pix(pred, self.gt)
+            self.output = torch.cat(outs, dim=0).detach().cpu()
+            
+            if attack_exists and self.cri_pix:        
+                for t in range(iterations):
+                    # pixel loss   
+                    #print("\n\t\t\t\tIterations: {}".format(t))             
+                    l_pix = 0.
+                    for pred in outs:
+                        l_pix += self.cri_pix(pred, self.gt)
 
-                    # print('l pix ... ', l_pix)
-                if attack_opt['method'] == 'cospgd':                    
-                    with torch.no_grad():
-                        cossim = F.cosine_similarity(self.lq, self.gt, dim=1, eps=10**-20)
-                        #import ipdb;ipdb.set_trace()
-                        l_pix *= cossim.sum()
-                        l_pix /= cossim.shape[-1]*cossim.shape[-2]
-                l_pix.backward(retain_graph=True)
-                data_grad = self.lq.grad
-                self.lq = self.fgsm_attack(self.lq, attack_opt['epsilon'], attack_opt['alpha'], data_grad, clip_min, clip_max)
-                #self.lq.requires_grad = True 
-                #print(self.lq.requires_grad)
-                #images.grad=None
-                outs = []
-                m = self.opt['val'].get('max_minibatch', n)
-                i = 0
-                while i < n:
-                    j = i + m
-                    if j >= n:
-                        j = n
-                    pred = self.net_g(self.lq[i:j])
-                    if isinstance(pred, list):
-                        pred = pred[-1]
-                    outs.append(pred)#.detach().cpu())
-                    i = j
+                        # print('l pix ... ', l_pix)
+                    if attack_opt['method'] == 'cospgd':                    
+                        with torch.no_grad():
+                            cossim = F.cosine_similarity(self.lq, self.gt, dim=1, eps=10**-20)
+                            #import ipdb;ipdb.set_trace()
+                            l_pix *= cossim.sum()
+                            l_pix /= cossim.shape[-1]*cossim.shape[-2]
+                    #l_pix.backward()#retain_graph=True)                        
+                    #data_grad = self.lq.grad
+                    #import ipdb;ipdb.set_trace()
+                    data_grad = torch.autograd.grad(l_pix, self.lq, retain_graph=False, create_graph=False)[0]
+                    self.data_grad = str(data_grad.max().item())
+                    self.lq = self.fgsm_attack(self.lq, attack_opt['epsilon'], attack_opt['alpha'], data_grad, clip_min, clip_max)
+                    self.net_g.zero_grad()
+                    #self.lq.requires_grad = True 
+                    #print(self.lq.requires_grad)
+                    #images.grad=None
+                    outs = []
+                    m = self.opt['val'].get('max_minibatch', n)
+                    i = 0
+                    while i < n:
+                        j = i + m
+                        if j >= n:
+                            j = n
+                        pred = self.net_g(self.lq[i:j])
+                        if isinstance(pred, list):
+                            pred = pred[-1]
+                        outs.append(pred)#.detach())#.cpu())
+                        i = j
 
-                self.output = torch.cat(outs, dim=0).detach().cpu()
-                self.lq.retain_grad()                                               
-        self.net_g.train()
+                    self.output = torch.cat(outs, dim=0).detach().cpu()
+                    #self.lq.retain_grad()                                               
+            self.net_g.train()
+            #del self.lq
+            #del l_pix
+            torch.cuda.empty_cache()
         #self.net_g.to(dtype=dtype)
         #for m in self.net_g.modules():
         #    m.to(dtype=dtype)
         #self.lq.to(dtype=dtype)
         #self.gt.to(dtype=dtype)
+        return self.data_grad
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         dataset_name = dataloader.dataset.opt['name']
+        self.data_grad = None
         with_metrics = self.opt['val'].get('metrics') is not None
         if with_metrics:
             self.metric_results = {
@@ -377,7 +390,11 @@ class ImageRestorationModel(BaseModel):
             if self.opt['val'].get('grids', False):
                 self.grids()
 
-            self.test()
+            self.data_grad = self.test()
+            #print("Done: {}".format(idx))
+            if rank == 0:
+                pbar.set_postfix({"Sanity ":self.data_grad})
+            
 
             if self.opt['val'].get('grids', False):
                 self.grids_inverse()
